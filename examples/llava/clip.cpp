@@ -125,6 +125,8 @@ static std::string format(const char * fmt, ...) {
 #define TN_LN_2            "%s.blk.%d.ln2.%s"
 #define TN_LN_PRE          "%s.pre_ln.%s"
 #define TN_LN_POST         "%s.post_ln.%s"
+#define TN_LS_1            "%s.blk.%d.ls1.%s"
+#define TN_LS_2            "%s.blk.%d.ls2.%s"
 #define TN_TEXT_PROJ       "text_projection.weight"
 #define TN_VIS_PROJ        "visual_projection.weight"
 #define TN_LLAVA_PROJ      "mm.%d.%s"
@@ -142,6 +144,7 @@ static std::string format(const char * fmt, ...) {
 
 
 enum projector_type {
+    PROJECTOR_TYPE_INTERNVL,
     PROJECTOR_TYPE_MLP,
     PROJECTOR_TYPE_MLP_NORM,
     PROJECTOR_TYPE_LDP,
@@ -151,6 +154,7 @@ enum projector_type {
 };
 
 static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
+    { PROJECTOR_TYPE_INTERNVL, "mlp-internvl" },
     { PROJECTOR_TYPE_MLP, "mlp" },
     { PROJECTOR_TYPE_LDP, "ldp" },
     { PROJECTOR_TYPE_LDPV2, "ldpv2"},
@@ -430,6 +434,9 @@ struct clip_layer {
     struct ggml_tensor * ln_1_w;
     struct ggml_tensor * ln_1_b;
 
+    // layerscale 1
+    struct ggml_tensor * ls_1_w;
+
     // ff
     struct ggml_tensor * ff_i_w;
     struct ggml_tensor * ff_i_b;
@@ -440,6 +447,9 @@ struct clip_layer {
     // layernorm 2
     struct ggml_tensor * ln_2_w;
     struct ggml_tensor * ln_2_b;
+
+    // layerscale 2
+    struct ggml_tensor * ls_2_w;
 };
 
 struct clip_vision_model {
@@ -551,6 +561,7 @@ struct clip_ctx {
     bool has_pre_norm = true;
     bool has_post_norm = false;
     bool has_patch_bias = false;
+    bool has_layer_scale = false;
 
     struct gguf_context * ctx_gguf;
     struct ggml_context * ctx_data;
@@ -725,6 +736,10 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
         // attention output
         cur = ggml_add(ctx0, ggml_mul_mat(ctx0, model.layers[il].o_w, cur), model.layers[il].o_b);
 
+        if(ctx->has_layer_scale) {
+            cur = ggml_mul(ctx0, cur, model.layers[il].ls_1_w);
+        }
+
         // re-add the layer input, e.g., residual
         cur = ggml_add(ctx0, cur, embeddings);
 
@@ -748,6 +763,11 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
 
         cur = ggml_mul_mat(ctx0, model.layers[il].ff_o_w, cur);
         cur = ggml_add(ctx0, cur, model.layers[il].ff_o_b);
+        
+        if(ctx->has_layer_scale) {
+            printf("Applying layer scale\n");
+            cur = ggml_mul(ctx0, cur, model.layers[il].ls_2_w);
+        }
 
         // residual 2
         cur = ggml_add(ctx0, embeddings, cur);
@@ -806,6 +826,51 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             embeddings = ggml_norm(ctx0, embeddings, eps);
             embeddings = ggml_add(ctx0, ggml_mul(ctx0, embeddings, model.mm_4_w),
                                 model.mm_4_b);
+        } else if (ctx->proj_type == PROJECTOR_TYPE_INTERNVL) {
+
+            // oh lord we're implementing the pixel shuffling now
+            
+            float scaling_factor = 0.5;
+            // shape currently might be [width, channels, batch, unused?] idk
+            int64_t width_height = floor(sqrt(embeddings->ne[0]));
+            embeddings = ggml_reshape_4d(ctx0, embeddings, width_height, width_height, embeddings->ne[1], embeddings->ne[2]);
+
+            // is shape [width, height, channels, batch]? it's [1024, 1024, 1, 1]
+            // fixed: W, H, C, N --> W, H * scale, C // scale, N
+            embeddings = ggml_reshape_4d(ctx0, embeddings, embeddings->ne[0], floor(embeddings->ne[1] * scaling_factor), floor(embeddings->ne[2] / scaling_factor), embeddings->ne[3]);
+            // fixed: W, H * scale, C // scale, N --> H * scale, W, C // scale, N
+            embeddings = ggml_permute(ctx0, embeddings, 1, 0, 2, 3);
+            embeddings = ggml_cont(ctx0, embeddings);
+            // original (wrong order): N, H * scale, W, C // scale --> N, H * scale, W * scale, C // (scale ** 2)
+            // fixed: H * scale, W, C // scale, N --> H * scale, W * scale, C // (scale ** 2), N
+            embeddings = ggml_reshape_4d(ctx0, embeddings, embeddings->ne[0], floor(embeddings->ne[1] * scaling_factor), floor(embeddings->ne[2] / scaling_factor), embeddings->ne[3]);
+
+            // swap W and H back
+            embeddings = ggml_permute(ctx0, embeddings, 1, 0, 2, 3);
+            embeddings = ggml_cont(ctx0, embeddings);
+
+            // flatten W and H to make W*H, C, N
+            embeddings = ggml_reshape_3d(ctx0, embeddings, embeddings->ne[0] * embeddings->ne[1], embeddings->ne[2], embeddings->ne[3]);
+
+            //i apparently got the dimension order wrong somewhere?? uhh this might not work
+            embeddings = ggml_permute(ctx0, embeddings, 1, 0, 2, 3);
+            embeddings = ggml_cont(ctx0, embeddings);
+            // layernorm
+            embeddings = ggml_norm(ctx0, embeddings, eps);
+            embeddings = ggml_add(ctx0, ggml_mul(ctx0, embeddings, model.mm_0_w),
+                                model.mm_0_b);
+
+            // linear
+            embeddings = ggml_mul_mat(ctx0, model.mm_1_w, embeddings);
+            embeddings = ggml_add(ctx0, embeddings, model.mm_1_b);
+
+            // gelu
+            embeddings = ggml_gelu(ctx0, embeddings);
+
+            // linear
+            embeddings = ggml_mul_mat(ctx0, model.mm_3_w, embeddings);
+            embeddings = ggml_add(ctx0, embeddings, model.mm_3_b);
+
         }
         else if (ctx->proj_type == PROJECTOR_TYPE_LDP) {
             // MobileVLM projector
@@ -1375,7 +1440,7 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
         }
 
         // LLaVA projection
-        if (new_clip->proj_type == PROJECTOR_TYPE_MLP || new_clip->proj_type == PROJECTOR_TYPE_MLP_NORM) {
+        if (new_clip->proj_type == PROJECTOR_TYPE_MLP || new_clip->proj_type == PROJECTOR_TYPE_MLP_NORM || new_clip->proj_type == PROJECTOR_TYPE_INTERNVL) {
             vision_model.mm_0_w              = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 0, "weight"));
             vision_model.mm_0_b              = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 0, "bias"));
             try {
@@ -1485,6 +1550,14 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
             layer.ln_2_b = get_tensor(new_clip->ctx_data, format(TN_LN_2,        "v", il, "bias"));
             layer.ff_i_b = get_tensor(new_clip->ctx_data, format(TN_FFN_DOWN,    "v", il, "bias"));
             layer.ff_o_b = get_tensor(new_clip->ctx_data, format(TN_FFN_UP,      "v", il, "bias"));
+
+            try {
+                layer.ls_1_w = get_tensor(new_clip->ctx_data, format(TN_LS_1,        "v", il, "weight"));
+                layer.ls_2_w = get_tensor(new_clip->ctx_data, format(TN_LS_2,        "v", il, "weight"));
+                new_clip->has_layer_scale = true;
+            } catch (std::runtime_error & /*e*/) { 
+                new_clip->has_layer_scale = false;
+            }
         }
     }
 
@@ -2600,7 +2673,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
     if (ctx->proj_type == PROJECTOR_TYPE_MLP) {
         return ctx->vision_model.mm_2_b->ne[0];
     }
-    if (ctx->proj_type == PROJECTOR_TYPE_MLP_NORM) {
+    if (ctx->proj_type == PROJECTOR_TYPE_MLP_NORM || ctx->proj_type == PROJECTOR_TYPE_INTERNVL) {
         return ctx->vision_model.mm_3_b->ne[0];
     }
     if (ctx->proj_type == PROJECTOR_TYPE_RESAMPLER) {

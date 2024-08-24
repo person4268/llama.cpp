@@ -6,7 +6,7 @@ import re
 import torch
 import numpy as np
 from gguf import *
-from transformers import CLIPModel, CLIPProcessor, CLIPVisionModel
+from transformers import AutoModel, CLIPModel, CLIPProcessor, CLIPVisionModel
 
 TEXT = "clip.text"
 VISION = "clip.vision"
@@ -16,7 +16,7 @@ def k(raw_key: str, arch: str) -> str:
     return raw_key.format(arch=arch)
 
 
-def should_skip_tensor(name: str, has_text: bool, has_vision: bool, has_llava: bool) -> bool:
+def should_skip_tensor(name: str, has_text: bool, has_vision: bool, has_llava: bool, has_internvl: bool) -> bool:
     if name in (
         "logit_scale",
         "text_model.embeddings.position_ids",
@@ -32,6 +32,9 @@ def should_skip_tensor(name: str, has_text: bool, has_vision: bool, has_llava: b
 
     if name.startswith("t") and not has_text:
         return True
+    
+    if (name.startswith("language_model") or name.startswith("mlp1")) and has_internvl:
+        return True
 
     return False
 
@@ -44,8 +47,15 @@ def get_tensor_name(name: str) -> str:
         name = re.sub(r'mm\.mlp\.mlp', 'mm.model.mlp', name, count=1)
         name = re.sub(r'mm\.peg\.peg', 'mm.model.peg', name, count=1)
         return name
-
-    return name.replace("text_model", "t").replace("vision_model", "v").replace("encoder.layers", "blk").replace("embeddings.", "").replace("_proj", "").replace("self_attn.", "attn_").replace("layer_norm", "ln").replace("layernorm", "ln").replace("mlp.fc1", "ffn_down").replace("mlp.fc2", "ffn_up").replace("embedding", "embd").replace("final", "post").replace("layrnorm", "ln")
+    if "mlp1" in name: # internvl
+        name = name.replace("mlp1", "mm")
+    if "position_embedding" in name and ".weight" not in name: # internvl has position_embd, not position_embd.weight
+        print(f"position_embedding: {name} -> {name}.weight")
+        name = name + ".weight"
+    if "ls1" in name or "ls2" in name:
+        name = name.replace("ls1", "ls1.weight").replace("ls2", "ls2.weight")
+    
+    return name.replace("text_model", "t").replace("vision_model", "v").replace("encoder.layers", "blk").replace("embeddings.", "").replace("_proj", "").replace("self_attn.", "attn_").replace("layer_norm", "ln").replace("layernorm", "ln").replace("mlp.fc1", "ffn_down").replace("mlp.fc2", "ffn_up").replace("embedding", "embd").replace("final", "post").replace("layrnorm", "ln").replace("norm", "ln").replace("attn.proj", "attn_out")
 
 
 def bytes_to_unicode():
@@ -73,6 +83,41 @@ def bytes_to_unicode():
     cs = [chr(n) for n in cs]
     return dict(zip(bs, cs))
 
+def permute(weights: torch.Tensor, n_head: int, n_head_kv: int | None):
+        """
+        Taken from convert_hf_to_gguf.py's LlamaModel
+        """
+        if n_head_kv is not None and n_head != n_head_kv:
+            n_head = n_head_kv
+        return (weights.reshape(n_head, 2, weights.shape[0] // n_head // 2, *weights.shape[1:])
+                .swapaxes(1, 2)
+                .reshape(weights.shape))
+
+def internvl_reshape_attn(data_torch: torch.Tensor, num_heads: int, n_embd: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # num_heads = self.hparams["num_attention_heads"]
+    num_kv_heads = num_heads # todo: verify
+    # n_embd = self.hparams["hidden_size"]
+    q_per_kv = num_heads // num_kv_heads
+    head_dim = n_embd // num_heads
+    num_groups = num_heads // q_per_kv
+
+    # print(f"num_heads: {num_heads}, n_embd: {n_embd}, q_per_kv: {q_per_kv}, head_dim: {head_dim}, num_groups: {num_groups}")
+
+    qkv = data_torch
+    # print(f"qkv shape: {qkv.shape}")
+
+    # qkv = qkv.reshape((num_groups, q_per_kv + 2, head_dim, n_embd))
+    # q, k, v = qkv[:, : q_per_kv], qkv[:, -2], qkv[:, -1]
+
+    # # The model weights of q and k equire additional reshape.
+    # q = permute(q.reshape((-1, q.shape[-1])), num_heads, num_heads)
+    # k = permute(k.reshape((-1, k.shape[-1])), num_heads, num_kv_heads)
+    # v = v.reshape((-1, v.shape[-1]))
+
+    # let's try something naive
+    q, k, v = torch.split(qkv, n_embd, dim=0)
+
+    return (q, k, v)
 
 ap = argparse.ArgumentParser()
 ap.add_argument("-m", "--model-dir", help="Path to model directory cloned from HF Hub", required=True)
@@ -81,6 +126,7 @@ ap.add_argument("--text-only", action="store_true", required=False,
                 help="Save a text-only model. It can't be used to encode images")
 ap.add_argument("--vision-only", action="store_true", required=False,
                 help="Save a vision-only model. It can't be used to encode texts")
+ap.add_argument("--internvl", action="store_true", required=False, help="The model is InternVL")
 ap.add_argument("--clip-model-is-vision", action="store_true", required=False,
                 help="The clip model is a pure vision model (ShareGPT4V vision extract for example)")
 ap.add_argument("--clip-model-is-openclip", action="store_true", required=False,
@@ -122,6 +168,9 @@ with open(dir_model + "/config.json", "r", encoding="utf-8") as f:
     if args.clip_model_is_vision:
         v_hparams = config
         t_hparams = None
+    elif args.internvl:
+        v_hparams = config["vision_config"]
+        t_hparams = None
     else:
         v_hparams = config["vision_config"]
         t_hparams = config["text_config"]
@@ -140,6 +189,14 @@ if args.use_f32:
 if args.clip_model_is_vision or args.clip_model_is_openclip:
     model = CLIPVisionModel.from_pretrained(dir_model)
     processor = None
+elif args.internvl:
+    model = AutoModel.from_pretrained(dir_model, trust_remote_code=True)
+    processor = None
+    with open(dir_model + "/preprocessor_config.json", "r", encoding="utf-8") as f:
+        preproc_config = json.load(f)
+        default_image_mean = preproc_config["image_mean"]
+        default_image_std = preproc_config["image_std"]
+
 else:
     model = CLIPModel.from_pretrained(dir_model)
     processor = CLIPProcessor.from_pretrained(dir_model)
@@ -180,7 +237,10 @@ elif args.vision_only and not has_llava_projector:
 elif has_llava_projector:
     fout.add_description("image encoder for LLaVA")
     # add projector type
-    fout.add_string("clip.projector_type", args.projector_type)
+    if not args.internvl:
+        fout.add_string("clip.projector_type", args.projector_type)
+    else:
+        fout.add_string("clip.projector_type", "mlp-internvl")
 else:
     fout.add_description("two-tower CLIP model")
 
@@ -203,7 +263,10 @@ if has_vision_encoder:
     fout.add_uint32("clip.vision.patch_size", v_hparams["patch_size"])
     fout.add_uint32(k(KEY_EMBEDDING_LENGTH, VISION), v_hparams["hidden_size"])
     fout.add_uint32(k(KEY_FEED_FORWARD_LENGTH, VISION), v_hparams["intermediate_size"])
-    fout.add_uint32("clip.vision.projection_dim", v_hparams.get("projection_dim", config["projection_dim"]))
+    if not args.internvl:
+        fout.add_uint32("clip.vision.projection_dim", v_hparams.get("projection_dim", config["projection_dim"]))
+    else:
+        fout.add_uint32("clip.vision.projection_dim", 0) # hoping something down the line will explode (if this is actually used)
     fout.add_uint32(k(KEY_ATTENTION_HEAD_COUNT, VISION), v_hparams["num_attention_heads"])
     fout.add_float32(k(KEY_ATTENTION_LAYERNORM_EPS, VISION), v_hparams["layer_norm_eps"])
     block_count = v_hparams["num_hidden_layers"] - 1 if has_llava_projector else v_hparams["num_hidden_layers"]
@@ -274,10 +337,13 @@ fout.add_bool("clip.use_gelu", use_gelu)
 
 
 if has_llava_projector:
+    print("doing projector tensors")
     model.vision_model.encoder.layers.pop(-1)  # pyright: ignore[reportAttributeAccessIssue]
     projector = torch.load(args.llava_projector)
     for name, data in projector.items():
+        pre_name = name
         name = get_tensor_name(name)
+        print(f"projector: {pre_name} -> {name}")
         # pw and dw conv ndim==4
         if data.ndim == 2 or data.ndim == 4:
             data = data.squeeze().numpy().astype(np.float16)
@@ -288,41 +354,55 @@ if has_llava_projector:
 
     print("Projector tensors added\n")
 
-state_dict = model.state_dict()  # pyright: ignore[reportAttributeAccessIssue]
-for name, data in state_dict.items():
-    if should_skip_tensor(name, has_text_encoder, has_vision_encoder, has_llava_projector):
-        # we don't need this
-        print(f"skipping parameter: {name}")
-        continue
 
-    name = get_tensor_name(name)
-    data = data.squeeze().numpy()
-
+def convert_pytorch_tensor_to_numpy(inp: torch.Tensor) -> tuple[np.ndarray, int]:
+    data = inp.squeeze().numpy()
     n_dims = len(data.shape)
 
     # ftype == 0 -> float32, ftype == 1 -> float16
     ftype_cur = 0
     if n_dims == 4:
-        print(f"tensor {name} is always saved in f16")
+        # print(f"tensor {name} is always saved in f16")
         data = data.astype(np.float16)
         ftype_cur = 1
     elif ftype == 1:
         if name[-7:] == ".weight" and n_dims == 2:
-            print("  Converting to float16")
+            # print("  Converting to float16")
             data = data.astype(np.float16)
             ftype_cur = 1
         else:
-            print("  Converting to float32")
+            # print("  Converting to float32")
             data = data.astype(np.float32)
             ftype_cur = 0
     else:
         if data.dtype != np.float32:
-            print("  Converting to float32")
+            # print("  Converting to float32")
             data = data.astype(np.float32)
             ftype_cur = 0
+    
+    return data, ftype_cur
 
-    print(f"{name} - {ftype_str[ftype_cur]} - shape = {data.shape}")
-    fout.add_tensor(name, data)
+state_dict = model.state_dict()  # pyright: ignore[reportAttributeAccessIssue]
+for name, data in state_dict.items():
+    if should_skip_tensor(name, has_text_encoder, has_vision_encoder, has_llava_projector, args.internvl):
+        # we don't need this
+        # print(f"skipping parameter: {name}")
+        continue
+
+    name = get_tensor_name(name)
+
+    if args.internvl and "attn.qkv" in name:
+        Q, K, V = internvl_reshape_attn(data, v_hparams["num_attention_heads"], v_hparams["hidden_size"])
+        Q_np, _ = convert_pytorch_tensor_to_numpy(Q)
+        K_np, _ = convert_pytorch_tensor_to_numpy(K)
+        V_np, _ = convert_pytorch_tensor_to_numpy(V)
+        fout.add_tensor(name.replace("attn.qkv", "attn_q"), Q_np)
+        fout.add_tensor(name.replace("attn.qkv", "attn_k"), K_np)
+        fout.add_tensor(name.replace("attn.qkv", "attn_v"), V_np)
+    else:
+        data, ftype_cur = convert_pytorch_tensor_to_numpy(data)
+        # print(f"{name} - {ftype_str[ftype_cur]} - shape = {data.shape}")
+        fout.add_tensor(name, data)
 
 
 fout.write_header_to_file()
