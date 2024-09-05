@@ -2695,3 +2695,8 @@ int clip_is_minicpmv(const struct clip_ctx * ctx) {
     }
     return 0;
 }
+
+int clip_is_internvl(const struct clip_ctx * ctx) {
+    if(!ctx->has_llava_projector) return 0;
+    return ctx->proj_type == PROJECTOR_TYPE_INTERNVL;
+}

@@ -372,6 +372,8 @@ bool llava_image_embed_make_with_clip_img(clip_ctx * ctx_clip, int n_threads, co
     int num_max_patches = 6;
     if (clip_is_minicpmv(ctx_clip)) {
         num_max_patches = 10;
+    } else if (clip_is_internvl(ctx_clip)) {
+        num_max_patches = 12;
     }
     float * image_embd = (float *)malloc(clip_embd_nbytes(ctx_clip)*num_max_patches); // TODO: base on gridsize/llava model
     if (!image_embd) {
